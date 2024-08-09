@@ -1,7 +1,7 @@
 Tristan:
-[] phase_estimators/hamiltonian_phase_estimation.py
-[] phase_estimators/ipe.py
-[] phase_estimators/phase_estimation.py
+[x] phase_estimators/hamiltonian_phase_estimation.py
+[x] phase_estimators/ipe.py
+[x] phase_estimators/phase_estimation.py
 [] eigensolvers/vqd.py
 [] amplitude_amplifiers/grover.py
 [] time_evolvers/pvqd/utils.py
