@@ -37,8 +37,8 @@ Results
 
 """
 
+from .state_fidelity_result import StateFidelityResult
 from .base_state_fidelity import BaseStateFidelity
 from .compute_uncompute import ComputeUncompute
-from .state_fidelity_result import StateFidelityResult
 
 __all__ = ["BaseStateFidelity", "ComputeUncompute", "StateFidelityResult"]

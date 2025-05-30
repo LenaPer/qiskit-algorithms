@@ -15,10 +15,10 @@
 import unittest
 
 import numpy as np
-from ddt import ddt
+from ddt import ddt, data
 from qiskit.circuit import QuantumCircuit, ParameterVector
 from qiskit.circuit.library import RealAmplitudes
-from qiskit.primitives import StatevectorSampler as Sampler
+from qiskit.primitives import StatevectorSampler
 from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 
 from qiskit_algorithms.state_fidelities import ComputeUncompute
@@ -51,37 +51,32 @@ class TestComputeUncompute(QiskitAlgorithmsTestCase):
         rx_rotation.h(1)
 
         self._circuit = [rx_rotations, ry_rotations, plus, zero, rx_rotation]
-        self._sampler = Sampler(seed=123, default_shots=10_000)
+        self._sampler = StatevectorSampler(seed=123, default_shots=10_000)
         self._left_params = np.array([[0, 0], [np.pi / 2, 0], [0, np.pi / 2], [np.pi, np.pi]])
         self._right_params = np.array([[0, 0], [0, 0], [np.pi / 2, 0], [0, 0]])
 
-    def test_1param_pair(self):
+    @data(False, True)
+    def test_1param_pair(self, local):
         """test for fidelity with one pair of parameters"""
-        fidelity = ComputeUncompute(self._sampler)
+        fidelity = ComputeUncompute(self._sampler, local=local)
         job = fidelity.run(
-            self._circuit[0], self._circuit[1], self._left_params[0], self._right_params[0]
+            [(self._circuit[0], self._left_params[0])],
+            [(self._circuit[1], self._right_params[0])]
         )
-        result = job.result()
-        np.testing.assert_allclose(result.fidelities, np.array([1.0]))
-
-    def test_1param_pair_local(self):
-        """test for fidelity with one pair of parameters"""
-        fidelity = ComputeUncompute(self._sampler, local=True)
-        job = fidelity.run(
-            self._circuit[0], self._circuit[1], self._left_params[0], self._right_params[0]
-        )
-        result = job.result()
-        np.testing.assert_allclose(result.fidelities, np.array([1.0]))
+        result = job.result()[0]
+        np.testing.assert_allclose(result.data.fidelities, np.array([1.0]))
 
     def test_local(self):
         """test difference between local and global fidelity"""
         fidelity_global = ComputeUncompute(self._sampler, local=False)
         fidelity_local = ComputeUncompute(self._sampler, local=True)
         fidelities = []
+
         for fidelity in [fidelity_global, fidelity_local]:
-            job = fidelity.run(self._circuit[2], self._circuit[3])
-            result = job.result()
-            fidelities.append(result.fidelities[0])
+            job = fidelity.run([self._circuit[2]], [self._circuit[3]])
+            result = job.result()[0]
+            fidelities.append(result.data.fidelities[0])
+
         np.testing.assert_allclose(fidelities, np.array([0.25, 0.5]), atol=1e-2, rtol=1e-2)
 
     def test_4param_pairs(self):
@@ -89,11 +84,34 @@ class TestComputeUncompute(QiskitAlgorithmsTestCase):
         fidelity = ComputeUncompute(self._sampler)
         n = len(self._left_params)
         job = fidelity.run(
-            [self._circuit[0]] * n, [self._circuit[1]] * n, self._left_params, self._right_params
+            [(self._circuit[0], self._left_params)],
+            [(self._circuit[1], self._right_params)]
         )
-        results = job.result()
+        results = job.result()[0]
         np.testing.assert_allclose(
-            results.fidelities, np.array([1.0, 0.5, 0.25, 0.0]), atol=1e-2, rtol=1e-2
+            results.data.fidelities, np.array([1.0, 0.5, 0.25, 0.0]), atol=1e-2, rtol=1e-2
+        )
+
+    def test_2_pubs(self):
+        """test for fidelity with four pairs of parameters"""
+        fidelity = ComputeUncompute(self._sampler)
+        n = len(self._left_params)
+        job = fidelity.run(
+            [
+                (self._circuit[0], self._left_params[:2]),
+                (self._circuit[0], self._left_params[2:]),
+            ],
+            [
+                (self._circuit[1], self._right_params[:2]),
+                (self._circuit[1], self._right_params[2:])
+            ]
+        )
+        result_1, result_2 = job.result()
+        np.testing.assert_allclose(
+            result_1.data.fidelities, np.array([1.0, 0.5]), atol=1e-2, rtol=1e-2
+        )
+        np.testing.assert_allclose(
+            result_2.data.fidelities, np.array([0.25, 0.0]), atol=1e-2, rtol=1e-2
         )
 
     def test_symmetry(self):
@@ -279,9 +297,9 @@ class TestComputeUncompute(QiskitAlgorithmsTestCase):
             counts[0] = kwargs["count"]
 
         fidelity = ComputeUncompute(
-            Sampler(), transpiler=pass_manager, transpiler_options={"callback": callback}
+            self._sampler, transpiler=pass_manager, transpiler_options={"callback": callback}
         )
-        fidelity._construct_circuits(QuantumCircuit(1), QuantumCircuit(1))
+        fidelity._construct_circuit(QuantumCircuit(1), QuantumCircuit(1))
 
         self.assertEqual(counts[0], 16)
 

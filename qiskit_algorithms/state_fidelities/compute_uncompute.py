@@ -1,6 +1,6 @@
 # This code is part of a Qiskit project.
 #
-# (C) Copyright IBM 2022, 2023.
+# (C) Copyright IBM 2022, 2025.
 #
 # This code is licensed under the Apache License, Version 2.0. You may
 # obtain a copy of this license in the LICENSE.txt file in the root directory
@@ -16,14 +16,15 @@ Compute-uncompute fidelity interface using primitives
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Iterable
 
+import numpy as np
 from qiskit import QuantumCircuit
-from qiskit.primitives import BaseSamplerV2
+from qiskit.primitives import BaseSamplerV2, PrimitiveResult, DataBin
 from qiskit.primitives.containers.sampler_pub import SamplerPub
 from qiskit.primitives.primitive_job import PrimitiveJob
 
-from .base_state_fidelity import BaseStateFidelity
+from .base_state_fidelity import BaseStateFidelity, StateFidelityPubLike
 from .state_fidelity_result import StateFidelityResult
 from ..algorithm_job import AlgorithmJob
 from ..custom_types import Transpiler
@@ -122,25 +123,19 @@ class ComputeUncompute(BaseStateFidelity):
 
     def _run(
         self,
-        circuits_1: QuantumCircuit | Sequence[QuantumCircuit],
-        circuits_2: QuantumCircuit | Sequence[QuantumCircuit],
-        values_1: Sequence[float] | Sequence[Sequence[float]] | None = None,
-        values_2: Sequence[float] | Sequence[Sequence[float]] | None = None,
-        shots: int | Sequence[int] | None = None,
-    ) -> AlgorithmJob:
+        pubs_1: Iterable[StateFidelityPubLike],
+        pubs_2: Iterable[StateFidelityPubLike],
+        shots: int | None,
+    ) -> AlgorithmJob[PrimitiveResult[StateFidelityResult]]:
         r"""
         Computes the state overlap (fidelity) calculation between two
         (parametrized) circuits (first and second) for a specific set of parameter
         values (first and second) following the compute-uncompute method.
 
         Args:
-            circuits_1: (Parametrized) quantum circuits preparing :math:`|\psi\rangle`.
-            circuits_2: (Parametrized) quantum circuits preparing :math:`|\phi\rangle`.
-            values_1: Numerical parameters to be bound to the first circuits.
-            values_2: Numerical parameters to be bound to the second circuits.
-            shots: Number of shots to be used by the underlying sampler. If a single integer is
-                provided, this number will be used for all circuits. If a sequence of integers is
-                provided, they will be used on a per-circuit basis. If none is provided, the
+            pubs_1: (Parametrized) quantum circuit and parameter values preparing :math:`|\psi\rangle`.
+            pubs_2: (Parametrized) quantum circuit and parameter values preparing :math:`|\phi\rangle`. It must contain as many elements as `pubs_1`.
+            shots: Number of shots to be used by the underlying sampler. If None is provided, the
                 fidelity's default number of shots will be used for all circuits. If this number is
                 also set to None, the underlying primitive's default number of shots will be used
                 for all circuits.
@@ -149,31 +144,36 @@ class ComputeUncompute(BaseStateFidelity):
             An AlgorithmJob for the fidelity calculation.
 
         Raises:
-            ValueError: At least one pair of circuits must be defined.
             AlgorithmError: If the sampler job is not completed successfully.
         """
-        circuits = self._construct_circuits(circuits_1, circuits_2)
-        if len(circuits) == 0:
-            raise ValueError(
-                "At least one pair of circuits must be defined to calculate the state overlap."
-            )
-        values = self._construct_value_list(circuits_1, circuits_2, values_1, values_2)
-
         # The priority of number of shots options is as follows:
         # number in `run` method > fidelity's default number of shots >
         # primitive's default number of shots.
-        if not isinstance(shots, Sequence):
-            if shots is None:
-                shots = self.shots
-            coerced_pubs = [
-                SamplerPub.coerce((circuit, value), shots)
-                for circuit, value in zip(circuits, values)
-            ]
-        else:
-            coerced_pubs = [
-                SamplerPub.coerce((circuit, value), shots_number)
-                for circuit, value, shots_number in zip(circuits, values, shots)
-            ]
+        if shots is None:
+            shots = self.shots
+
+        coerced_1: list[SamplerPub] = [SamplerPub.coerce(pub) for pub in pubs_1]
+        coerced_2: list[SamplerPub] = [SamplerPub.coerce(pub) for pub in pubs_2]
+
+        circuits = self._construct_circuits(
+            [pub.circuit for pub in coerced_1],
+            [pub.circuit for pub in coerced_2],
+        )
+
+        values = [
+            self._construct_value_list(
+                pub1.circuit,
+                pub2.circuit,
+                pub1.parameter_values,
+                pub2.parameter_values
+            ) for (pub1, pub2) in zip(coerced_1, coerced_2)]
+
+        coerced_pubs = [
+            SamplerPub.coerce(
+                (circuit, value),
+                shots
+            ) for (circuit, value) in zip(circuits, values)
+        ]
 
         job = self._sampler.run(coerced_pubs)
 
@@ -182,45 +182,49 @@ class ComputeUncompute(BaseStateFidelity):
     @staticmethod
     def _call(
         job: PrimitiveJob, circuits: Sequence[QuantumCircuit], local: bool
-    ) -> StateFidelityResult:
+    ) -> PrimitiveResult[StateFidelityResult]:
         try:
-            result = job.result()
+            pubs_results = job.result()
         except Exception as exc:
             raise AlgorithmError("Sampler job failed!") from exc
 
-        pub_results_data = [
-            getattr(pub_result.data, circuit.cregs[0].name)
-            for pub_result, circuit in zip(result, circuits)
-        ]
-        quasi_dists = [
-            {
-                label: value / prob_dist.num_shots
-                for label, value in prob_dist.get_int_counts().items()
-            }
-            for prob_dist in pub_results_data
-        ]
+        state_fidelity_results: list[StateFidelityResult] = []
 
-        if local:
-            raw_fidelities = [
-                ComputeUncompute._get_local_fidelity(prob_dist, circuit.num_qubits)
-                for prob_dist, circuit in zip(quasi_dists, circuits)
+        for result, circuit in zip(pubs_results, circuits):
+            quasi_dists = [
+                {
+                    label: value / result.data.meas.num_shots
+                    for label, value in result.data.meas.get_int_counts(i).items()
+                }
+                for i in range(result.data.meas.shape[0])
             ]
-        else:
-            raw_fidelities = [
-                ComputeUncompute._get_global_fidelity(prob_dist) for prob_dist in quasi_dists
-            ]
-        fidelities = ComputeUncompute._truncate_fidelities(raw_fidelities)
-        shots = [pub_result_data.num_shots for pub_result_data in pub_results_data]
 
-        if len(shots) == 1:
-            shots = shots[0]
+            if local:
+                raw_fidelities = np.array([
+                    ComputeUncompute._get_local_fidelity(prob_dist, circuit.num_qubits)
+                    for prob_dist in quasi_dists
+                ])
+            else:
+                raw_fidelities = np.array([
+                    ComputeUncompute._get_global_fidelity(prob_dist) for prob_dist in quasi_dists
+                ])
 
-        return StateFidelityResult(
-            fidelities=fidelities,
-            raw_fidelities=raw_fidelities,
-            metadata=result.metadata,
-            shots=shots,
-        )
+            fidelities = ComputeUncompute._truncate_fidelities(raw_fidelities)
+
+            data = DataBin(
+                fidelities=fidelities,
+                raw_fidelities=raw_fidelities,
+                shape=fidelities.shape
+            )
+
+            state_fidelity_results.append(
+                StateFidelityResult(
+                    data=data,
+                    metadata=result.metadata,
+                )
+            )
+
+        return PrimitiveResult(state_fidelity_results)
 
     @property
     def shots(self) -> int | None:

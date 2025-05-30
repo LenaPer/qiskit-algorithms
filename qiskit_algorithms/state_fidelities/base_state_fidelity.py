@@ -1,6 +1,6 @@
 # This code is part of a Qiskit project.
 #
-# (C) Copyright IBM 2022, 2024.
+# (C) Copyright IBM 2022, 2025.
 #
 # This code is licensed under the Apache License, Version 2.0. You may
 # obtain a copy of this license in the LICENSE.txt file in the root directory
@@ -14,22 +14,31 @@ Base state fidelity interface
 """
 
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from collections.abc import MutableMapping
-from typing import cast, Sequence, List, Any
-import numpy as np
 
+from abc import ABC, abstractmethod
+from typing import Any, Union, Iterable
+
+import numpy as np
+from numpy._typing import ArrayLike
 from qiskit import QuantumCircuit
 from qiskit.circuit import ParameterVector
-from qiskit.primitives.utils import _circuit_key
+from qiskit.primitives import BindingsArrayLike, PrimitiveResult
 
+from . import StateFidelityResult
 from ..algorithm_job import AlgorithmJob
 from ..custom_types import Transpiler
+
+# FIXME: should be placed in custom_types.py?
+StateFidelityPubLike = Union[
+    QuantumCircuit,
+    tuple[QuantumCircuit],
+    tuple[QuantumCircuit, BindingsArrayLike],
+]
 
 
 class BaseStateFidelity(ABC):
     r"""
-    An interface to calculate state fidelities (state overlaps) for pairs of
+    An interface to calculate state fidelities (state overlaps) for a pair of
     (parametrized) quantum circuits. The calculation depends on the particular
     fidelity method implementation, but can be always defined as the state overlap:
 
@@ -40,7 +49,6 @@ class BaseStateFidelity(ABC):
     where :math:`x` and :math:`y` are optional parametrizations of the
     states :math:`\psi` and :math:`\phi` prepared by the circuits
     ``circuit_1`` and ``circuit_2``, respectively.
-
     """
 
     def __init__(
@@ -57,21 +65,20 @@ class BaseStateFidelity(ABC):
                 method as keyword arguments.
         """
         # use cache for preventing unnecessary circuit compositions
-        self._circuit_cache: MutableMapping[tuple[int, int], QuantumCircuit] = {}
         self._transpiler = transpiler
         self._transpiler_options = transpiler_options if transpiler_options is not None else {}
 
     @staticmethod
     def _preprocess_values(
-        circuits: QuantumCircuit | Sequence[QuantumCircuit],
-        values: Sequence[float] | Sequence[Sequence[float]] | None = None,
-    ) -> Sequence[list[float]]:
+        circuit: QuantumCircuit,
+        values: ArrayLike | None = None,
+    ) -> np.ndarray:
         """
         Checks whether the passed values match the shape of the parameters
-        of the corresponding circuits and formats values to 2D list.
+        of the corresponding circuits and formats values to 2D array.
 
         Args:
-            circuits: List of circuits to be checked.
+            circuit: List of circuits to be checked.
             values: Parameter values corresponding to the circuits to be checked.
 
         Returns:
@@ -80,42 +87,32 @@ class BaseStateFidelity(ABC):
 
         Raises:
             ValueError: if the number of parameter values doesn't match the number of
-                        circuit parameters
+                        circuit parameters, or if values is a three or more dimensional array
             TypeError: if the input values are not a sequence.
         """
 
-        if isinstance(circuits, QuantumCircuit):
-            circuits = [circuits]
-
         if values is None:
-            for circuit in circuits:
-                if circuit.num_parameters != 0:
-                    raise ValueError(
-                        f"`values` cannot be `None` because circuit <{circuit.name}> has "
-                        f"{circuit.num_parameters} free parameters."
-                    )
-            return [[]]
-        else:
-
-            # Support ndarray
-            if isinstance(values, np.ndarray):
-                values = values.tolist()
-            if len(values) > 0 and isinstance(values[0], np.ndarray):
-                values = [v.tolist() for v in values]
-
-            if not isinstance(values, Sequence):
-                raise TypeError(
-                    f"Expected a sequence of numerical parameter values, "
-                    f"but got input type {type(values)} instead."
+            if circuit.num_parameters != 0:
+                raise ValueError(
+                    f"`values` cannot be `None` because circuit <{circuit.name}> has "
+                    f"{circuit.num_parameters} free parameters."
                 )
+            return np.array([[]])
 
-            # ensure 2d
-            if len(values) > 0 and not isinstance(values[0], Sequence) or len(values) == 0:
-                values = [cast(List[float], values)]
+        values = np.atleast_2d(values)
 
-            # we explicitly cast the type here because mypy appears to be unable to understand the
-            # above few lines where we ensure that values are 2d
-            return cast(Sequence[List[float]], values)
+        if len(values.shape) > 2:
+            raise ValueError(
+                f"values must be a two or less dimensional array, but its shape is {values.shape}."
+            )
+
+        if circuit.num_parameters != values.shape[1]:
+            raise ValueError(
+                f"Circuit {circuit.name} has {circuit.num_parameters} parameters, but the parameter"
+                f" values array represents {values.shape[1]} parameters."
+            )
+
+        return values
 
     def _check_qubits_match(self, circuit_1: QuantumCircuit, circuit_2: QuantumCircuit) -> None:
         """
@@ -154,29 +151,24 @@ class BaseStateFidelity(ABC):
 
     def _construct_circuits(
         self,
-        circuits_1: QuantumCircuit | Sequence[QuantumCircuit],
-        circuits_2: QuantumCircuit | Sequence[QuantumCircuit],
-    ) -> Sequence[QuantumCircuit]:
+        circuits_1: list[QuantumCircuit],
+        circuits_2: list[QuantumCircuit],
+    ) -> list[QuantumCircuit]:
         """
-        Constructs the list of fidelity circuits to be evaluated.
-        These circuits represent the state overlap between pairs of input circuits,
-        and their construction depends on the fidelity method implementations.
+        Constructs the fidelity circuits to be evaluated.
+        These circuits represent the state overlap between a pair of input circuits,
+        and its construction depends on the fidelity method implementation.
 
         Args:
             circuits_1: (Parametrized) quantum circuits.
             circuits_2: (Parametrized) quantum circuits.
 
         Returns:
-            List of constructed fidelity circuits.
+            Constructed fidelity circuit.
 
         Raises:
             ValueError: if the length of the input circuit lists doesn't match.
         """
-
-        if isinstance(circuits_1, QuantumCircuit):
-            circuits_1 = [circuits_1]
-        if isinstance(circuits_2, QuantumCircuit):
-            circuits_2 = [circuits_2]
 
         if len(circuits_1) != len(circuits_2):
             raise ValueError(
@@ -184,30 +176,21 @@ class BaseStateFidelity(ABC):
                 f"and second circuit list ({len(circuits_2)}) is not the same."
             )
 
-        circuits = []
+        circuits: list[QuantumCircuit] = []
+
         for circuit_1, circuit_2 in zip(circuits_1, circuits_2):
+            self._check_qubits_match(circuit_1, circuit_2)
 
-            # Use the same key for circuits as qiskit.primitives use.
-            circuit = self._circuit_cache.get((_circuit_key(circuit_1), _circuit_key(circuit_2)))
+            # re-parametrize input circuits
+            # TODO: make smarter checks to avoid unnecessary re-parametrizations
+            parameters_1 = ParameterVector("x", circuit_1.num_parameters)
+            parametrized_circuit_1 = circuit_1.assign_parameters(parameters_1)
+            parameters_2 = ParameterVector("y", circuit_2.num_parameters)
+            parametrized_circuit_2 = circuit_2.assign_parameters(parameters_2)
 
-            if circuit is not None:
-                circuits.append(circuit)
-            else:
-                self._check_qubits_match(circuit_1, circuit_2)
-
-                # re-parametrize input circuits
-                # TODO: make smarter checks to avoid unnecessary re-parametrizations
-                parameters_1 = ParameterVector("x", circuit_1.num_parameters)
-                parametrized_circuit_1 = circuit_1.assign_parameters(parameters_1)
-                parameters_2 = ParameterVector("y", circuit_2.num_parameters)
-                parametrized_circuit_2 = circuit_2.assign_parameters(parameters_2)
-
-                circuit = self.create_fidelity_circuit(
-                    parametrized_circuit_1, parametrized_circuit_2
-                )
-                circuits.append(circuit)
-                # update cache
-                self._circuit_cache[_circuit_key(circuit_1), _circuit_key(circuit_2)] = circuit
+            circuits.append(self.create_fidelity_circuit(
+                parametrized_circuit_1, parametrized_circuit_2
+            ))
 
         if self._transpiler is not None:
             return self._transpiler.run(circuits, **self._transpiler_options)
@@ -216,67 +199,46 @@ class BaseStateFidelity(ABC):
 
     def _construct_value_list(
         self,
-        circuits_1: Sequence[QuantumCircuit],
-        circuits_2: Sequence[QuantumCircuit],
-        values_1: Sequence[float] | Sequence[Sequence[float]] | None = None,
-        values_2: Sequence[float] | Sequence[Sequence[float]] | None = None,
-    ) -> list[list[float]]:
+        circuit_1: QuantumCircuit,
+        circuit_2: QuantumCircuit,
+        values_1: ArrayLike | None,
+        values_2: ArrayLike | None,
+    ) -> np.ndarray:
         """
         Preprocesses input parameter values to match the fidelity
         circuit parametrization, and return in list format.
 
         Args:
-           circuits_1: (Parametrized) quantum circuits preparing the
-                        first list of quantum states.
-           circuits_2: (Parametrized) quantum circuits preparing the
-                        second list of quantum states.
-           values_1: Numerical parameters to be bound to the first circuits.
-           values_2: Numerical parameters to be bound to the second circuits.
+           circuit_1: (Parametrized) quantum circuit preparing the first quantum state.
+           circuit_2: (Parametrized) quantum circuits preparing the second quantum state.
+           values_1: Numerical parameters to be bound to the first circuit.
+           values_2: Numerical parameters to be bound to the second circuit.
 
         Returns:
              List of lists of parameter values for fidelity circuit.
-
         """
-        values_1 = self._preprocess_values(circuits_1, values_1)
-        values_2 = self._preprocess_values(circuits_2, values_2)
-        # now, values_1 and values_2 are explicitly made 2d lists
+        values_1 = self._preprocess_values(circuit_1, values_1)
+        values_2 = self._preprocess_values(circuit_2, values_2)
+        # now, values_1 and values_2 are explicitly made 2d arrays
 
-        values = []
-        if len(values_2[0]) == 0:
-            values = list(values_1)
-        elif len(values_1[0]) == 0:
-            values = list(values_2)
-        else:
-            for val_1, val_2 in zip(values_1, values_2):
-                # the `+` operation concatenates the lists
-                # and then this new list gets appended to the values list
-                values.append(val_1 + val_2)
-
-        # values is guaranteed to be 2d
-        return values
+        return np.hstack((values_1, values_2))
 
     @abstractmethod
     def _run(
         self,
-        circuits_1: QuantumCircuit | Sequence[QuantumCircuit],
-        circuits_2: QuantumCircuit | Sequence[QuantumCircuit],
-        values_1: Sequence[float] | Sequence[Sequence[float]] | None = None,
-        values_2: Sequence[float] | Sequence[Sequence[float]] | None = None,
-        shots: int | Sequence[int] | None = None,
-    ) -> AlgorithmJob:
+        pubs_1: Iterable[StateFidelityPubLike],
+        pubs_2: Iterable[StateFidelityPubLike],
+        shots: int | None,
+    ) -> AlgorithmJob[PrimitiveResult[StateFidelityResult]]:
         r"""
         Computes the state overlap (fidelity) calculation between two
         (parametrized) circuits (first and second) for a specific set of parameter
         values (first and second).
 
         Args:
-            circuits_1: (Parametrized) quantum circuits preparing :math:`|\psi\rangle`.
-            circuits_2: (Parametrized) quantum circuits preparing :math:`|\phi\rangle`.
-            values_1: Numerical parameters to be bound to the first set of circuits
-            values_2: Numerical parameters to be bound to the second set of circuits.
-            shots: Number of shots to be used by the underlying sampler. If a single integer is
-                provided, this number will be used for all circuits. If a sequence of integers is
-                provided, they will be used on a per-circuit basis. If none is provided, the
+            pubs_1: (Parametrized) quantum circuit and parameter values preparing :math:`|\psi\rangle`.
+            pubs_2: (Parametrized) quantum circuit and parameter values preparing :math:`|\phi\rangle`. It must contain as many elements as `pubs_1`.
+            shots: Number of shots to be used by the underlying sampler. If None is provided, the
                 fidelity's default number of shots will be used for all circuits. If this number is
                 also set to None, the underlying primitive's default number of shots will be used
                 for all circuits.
@@ -288,12 +250,10 @@ class BaseStateFidelity(ABC):
 
     def run(
         self,
-        circuits_1: QuantumCircuit | Sequence[QuantumCircuit],
-        circuits_2: QuantumCircuit | Sequence[QuantumCircuit],
-        values_1: Sequence[float] | Sequence[Sequence[float]] | None = None,
-        values_2: Sequence[float] | Sequence[Sequence[float]] | None = None,
-        shots: int | Sequence[int] | None = None,
-    ) -> AlgorithmJob:
+        pubs_1: Iterable[StateFidelityPubLike],
+        pubs_2: Iterable[StateFidelityPubLike],
+        shots: int | None = None,
+    ) -> AlgorithmJob[PrimitiveResult[StateFidelityResult]]:
         r"""
         Runs asynchronously the state overlap (fidelity) calculation between two
         (parametrized) circuits (first and second) for a specific set of parameter
@@ -301,13 +261,9 @@ class BaseStateFidelity(ABC):
         fidelity method implementation.
 
         Args:
-            circuits_1: (Parametrized) quantum circuits preparing :math:`|\psi\rangle`.
-            circuits_2: (Parametrized) quantum circuits preparing :math:`|\phi\rangle`.
-            values_1: Numerical parameters to be bound to the first set of circuits.
-            values_2: Numerical parameters to be bound to the second set of circuits.
-            shots: Number of shots to be used by the underlying sampler. If a single integer is
-                provided, this number will be used for all circuits. If a sequence of integers is
-                provided, they will be used on a per-circuit basis. If none is provided, the
+            pubs_1: (Parametrized) quantum circuit and parameter values preparing :math:`|\psi\rangle`.
+            pubs_2: (Parametrized) quantum circuit and parameter values preparing :math:`|\phi\rangle`. It must contain as many elements as `pubs_1`.
+            shots: Number of shots to be used by the underlying sampler. If None is provided, the
                 fidelity's default number of shots will be used for all circuits. If this number is
                 also set to None, the underlying primitive's default number of shots will be used
                 for all circuits.
@@ -316,13 +272,13 @@ class BaseStateFidelity(ABC):
             Primitive job for the fidelity calculation.
             The job's result is an instance of :class:`.StateFidelityResult`.
         """
-        job = self._run(circuits_1, circuits_2, values_1, values_2, shots)
+        job = self._run(pubs_1, pubs_2, shots)
 
         job._submit()
         return job
 
     @staticmethod
-    def _truncate_fidelities(fidelities: Sequence[float]) -> Sequence[float]:
+    def _truncate_fidelities(fidelities: np.ndarray) -> np.ndarray:
         """
         Ensures fidelity result in [0,1].
 
@@ -333,4 +289,4 @@ class BaseStateFidelity(ABC):
              List of truncated fidelities.
 
         """
-        return np.clip(fidelities, 0, 1).tolist()
+        return np.clip(fidelities, 0, 1)
